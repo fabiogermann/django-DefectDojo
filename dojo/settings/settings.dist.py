@@ -185,7 +185,7 @@ env = environ.FileAwareEnv(
     DD_SOCIAL_AUTH_EXCEPTION_MESSAGE_AUTH_TOKEN_ERROR=(str, "Social login failed due to an invalid or expired token. Please try again or use the standard login."),
     DD_SAML2_ENABLED=(bool, False),
     # Allows to override default SAML authentication backend. Check https://djangosaml2.readthedocs.io/contents/setup.html#custom-user-attributes-processing
-    DD_SAML2_AUTHENTICATION_BACKENDS=(str, "djangosaml2.backends.Saml2Backend"),
+    DD_SAML2_AUTHENTICATION_BACKENDS=(str, "dojo.backends.Saml2Backend"),
     # Force Authentication to make SSO possible with SAML2
     DD_SAML2_FORCE_AUTH=(bool, True),
     DD_SAML2_LOGIN_BUTTON_TEXT=(str, "Login with SAML"),
@@ -207,6 +207,9 @@ env = environ.FileAwareEnv(
         "Lastname": "last_name",
     }),
     DD_SAML2_ALLOW_UNKNOWN_ATTRIBUTE=(bool, False),
+    # SAML Group Mapping - automatically assign users to groups based on SAML assertion
+    DD_SAML2_GROUPS_ATTRIBUTE=(str, ""),  # Name of the SAML attribute containing group names (e.g. 'groups', 'memberOf')
+    DD_SAML2_GROUPS_FILTER=(str, ""),  # Optional regex to filter which groups to import (e.g. '^DOJO_.*' to only import groups starting with DOJO_)
     # Authentication via HTTP Proxy which put username to HTTP Header REMOTE_USER
     DD_AUTH_REMOTEUSER_ENABLED=(bool, False),
     # Names of headers which will be used for processing user data.
@@ -1024,6 +1027,10 @@ def saml2_attrib_map_format(din):
 SAML2_ENABLED = env("DD_SAML2_ENABLED")
 SAML2_LOGIN_BUTTON_TEXT = env("DD_SAML2_LOGIN_BUTTON_TEXT")
 SAML2_LOGOUT_URL = env("DD_SAML2_LOGOUT_URL")
+# SAML group mapping settings
+SAML2_GROUPS_ATTRIBUTE = env("DD_SAML2_GROUPS_ATTRIBUTE")
+SAML2_GROUPS_FILTER = env("DD_SAML2_GROUPS_FILTER")
+
 if SAML2_ENABLED:
     import saml2
     import saml2.saml
