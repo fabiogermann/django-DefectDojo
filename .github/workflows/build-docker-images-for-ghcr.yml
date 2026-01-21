@@ -1,0 +1,172 @@
+name: "Build and Push Docker Images to GHCR"
+
+env:
+  GIT_USERNAME: "DefectDojo release bot"
+  GIT_EMAIL: "dojo-release-bot@users.noreply.github.com"
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch-to-build:
+        type: string
+        description: 'Branch to checkout, build and publish'
+        required: false
+        default: ''
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      branch_name: ${{ steps.set-branch.outputs.branch_name }}
+      sanitized_branch: ${{ steps.sanitize.outputs.sanitized_branch }}
+      image_repository: ${{ steps.set-repo.outputs.image_repository }}
+    steps:
+      - name: Set branch name
+        id: set-branch
+        run: |
+          if [ -n "${{ inputs.branch-to-build }}" ]; then
+            echo "branch_name=${{ inputs.branch-to-build }}" >> $GITHUB_OUTPUT
+          else
+            echo "branch_name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Sanitize branch name for Docker tag
+        id: sanitize
+        run: |
+          BRANCH_NAME="${{ steps.set-branch.outputs.branch_name }}"
+          # Replace / with - and remove any invalid characters for Docker tags
+          SANITIZED=$(echo "$BRANCH_NAME" | sed 's/\//-/g' | sed 's/[^a-zA-Z0-9._-]/-/g' | tr '[:upper:]' '[:lower:]')
+          echo "sanitized_branch=$SANITIZED" >> $GITHUB_OUTPUT
+          echo "Sanitized branch name: $SANITIZED"
+
+      - name: Set image repository
+        id: set-repo
+        run: |
+          # Deduce repository name from GitHub repo
+          IMAGE_REPO=$(echo ${GITHUB_REPOSITORY%%/*} | tr '[:upper:]' '[:lower:]')
+          echo "image_repository=$IMAGE_REPO" >> $GITHUB_OUTPUT
+          echo "Image repository: $IMAGE_REPO"
+
+  build-and-push:
+    needs: prepare
+    runs-on: ${{ matrix.platform ==  'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ['linux/amd64', 'linux/arm64']
+        docker-image: [django] # nginx
+        os: [debian] # alpine
+        # exclude:
+        #   - docker-image: nginx
+        #     os: debian
+    steps:
+      # Replace slashes so we can use this in filenames
+      - name: Set platform variable
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM=${platform//\//-}" >> $GITHUB_ENV
+          echo "Platform: ${platform//\//-}"
+
+      - name: Checkout branch
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.branch_name }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build and push images
+        id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        env:
+          DOCKER_BUILD_CHECKS_ANNOTATIONS: false
+        with:
+          push: true
+          file: ./Dockerfile.${{ matrix.docker-image }}-${{ matrix.os }}
+          context: .
+          target: release
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,"name=ghcr.io/${{ needs.prepare.outputs.image_repository }}/defectdojo-${{ matrix.docker-image}}",push-by-digest=true,name-canonical=true
+          cache-from: type=gha,scope=${{ matrix.docker-image}}-${{ matrix.os }}-${{ env.PLATFORM }}-${{ needs.prepare.outputs.branch_name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.docker-image}}-${{ matrix.os }}-${{ env.PLATFORM }}-${{ needs.prepare.outputs.branch_name }}
+
+      # Export the digest to a file
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      # Upload the digest file as artifact
+      - name: Upload digest
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: digests-${{ matrix.docker-image}}-${{ matrix.os }}-${{ env.PLATFORM }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-digests:
+    needs: [prepare, build-and-push]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        docker-image: [django, nginx]
+        os: [alpine, debian]
+        exclude:
+          - docker-image: nginx
+            os: debian
+    steps:
+      # Download digests for this image and OS
+      - name: Download digests
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.docker-image}}-${{ matrix.os }}-*
+          merge-multiple: true
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      # Create OS-specific manifest list and push
+      - name: Create OS specific manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -x
+          docker buildx imagetools create -t "ghcr.io/${{ needs.prepare.outputs.image_repository }}/defectdojo-${{ matrix.docker-image}}:${{ needs.prepare.outputs.sanitized_branch }}-${{ matrix.os }}" --progress=plain \
+          $(printf 'ghcr.io/${{ needs.prepare.outputs.image_repository }}/defectdojo-${{ matrix.docker-image}}@sha256:%s ' *)
+
+      # Just for logging
+      - name: Inspect OS specific image
+        run: |
+          docker buildx imagetools inspect ghcr.io/${{ needs.prepare.outputs.image_repository }}/defectdojo-${{ matrix.docker-image}}:${{ needs.prepare.outputs.sanitized_branch }}-${{ matrix.os }}
+
+      # Debian images are the default / official ones for django, alpine for nginx
+      - name: Tag default images with os-less tags
+        if: ${{ (matrix.docker-image == 'django' && matrix.os == 'debian') || (matrix.docker-image == 'nginx' && matrix.os == 'alpine') }}
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -x
+          docker buildx imagetools create -t "ghcr.io/${{ needs.prepare.outputs.image_repository }}/defectdojo-${{ matrix.docker-image}}:${{ needs.prepare.outputs.sanitized_branch }}" ghcr.io/${{ needs.prepare.outputs.image_repository }}/defectdojo-${{ matrix.docker-image}}:${{ needs.prepare.outputs.sanitized_branch }}-${{ matrix.os }}
+
+      # Just for logging
+      - name: Inspect default images
+        if: ${{ (matrix.docker-image == 'django' && matrix.os == 'debian') || (matrix.docker-image == 'nginx' && matrix.os == 'alpine') }}
+        run: |
+          docker buildx imagetools inspect ghcr.io/${{ needs.prepare.outputs.image_repository }}/defectdojo-${{ matrix.docker-image}}:${{ needs.prepare.outputs.sanitized_branch }}
